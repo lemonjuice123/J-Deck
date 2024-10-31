@@ -1,0 +1,394 @@
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include "SSD1306.h"
+#include <EEPROM.h>
+
+extern "C" {
+#include "user_interface.h"
+typedef void (*wifi_promiscuous_cb_t)(uint8_t *buf, uint16_t len);
+}
+
+// Display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+SSD1306 display(0x3c, D2, D1);  // GPIO 5 = D1, GPIO 4 = D2
+
+// Button pins
+#define BUTTON_UP D6
+#define BUTTON_DOWN D5
+#define BUTTON_SELECT D4
+#define BUTTON_BACK D3
+
+// WiFi settings
+#define MAX_CH 13
+#define PACKET_RATE 5
+#define MAX_NETWORKS 8  // Maximum number of networks to display at once
+
+// Menu states
+enum MenuState {
+    MENU_MAIN,
+    MENU_WIFI_SCAN,
+    MENU_PACKET_MON,
+    MENU_TERMINAL,
+    MENU_CODE
+};
+
+MenuState currentState = MENU_MAIN;
+int selectedOption = 0;
+bool buttonPressed = false;
+int scrollOffset = 0;  // For scrolling through networks
+int totalNetworks = 0; // Total networks found
+
+// Struct to store network info
+struct NetworkInfo {
+    String ssid;
+    int32_t rssi;
+    uint8_t encType;
+    uint8_t* bssid;
+    int32_t channel;
+};
+
+NetworkInfo networks[MAX_NETWORKS];
+
+// Packet monitoring variables
+unsigned long pkts = 0;
+unsigned long deauths = 0;
+unsigned long prevTime = 0;
+int currentChannel = 1;
+unsigned int values[128];
+double multiplier = 1.0;
+
+// QR code settings
+#define QR_CODE_WIDTH  64
+#define QR_CODE_HEIGHT 64
+
+// Empty QR code bitmap array (64x64 pixels = 512 bytes)
+const unsigned char qrBitmap[] PROGMEM = {
+    // Your 64x64 QR code bitmap data will go here
+};
+
+// Menu items
+const char* mainMenu[] = {
+    "WiFi Scan",
+    "Packet Monitor",
+    "Terminal",
+    "Code"
+};
+const int mainMenuItems = 4;
+
+// Function declarations
+void ICACHE_RAM_ATTR wifiSnifferCallback(uint8_t *buf, uint16_t len);
+void setupWiFiSniffer();
+void drawMenu();
+void drawPacketMonitor();
+void drawQRCode();
+void handlePacketMonitor();
+void handleButtons();
+void scanNetworks();
+void drawWiFiList();
+void handleWiFiScan();
+
+// Function implementations
+void ICACHE_RAM_ATTR wifiSnifferCallback(uint8_t *buf, uint16_t len) {
+    pkts++;
+    if (buf[12] == 0xA0 || buf[12] == 0xC0) {
+        deauths++;
+    }
+}
+
+void setupWiFiSniffer() {
+    wifi_set_opmode(STATION_MODE);
+    wifi_promiscuous_enable(0);
+    WiFi.disconnect();
+    wifi_set_promiscuous_rx_cb((wifi_promiscuous_cb_t)wifiSnifferCallback);
+    wifi_set_channel(currentChannel);
+    wifi_promiscuous_enable(1);
+}
+
+void drawMenu() {
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+
+    for (int i = 0; i < mainMenuItems; i++) {
+        if (i == selectedOption) {
+            display.drawString(0, i * 16, ">");
+        }
+        display.drawString(10, i * 16, mainMenu[i]);
+    }
+    display.display();
+}
+
+void drawQRCode() {
+    display.clear();
+    // Center the QR code on the display
+    int x = (SCREEN_WIDTH - QR_CODE_WIDTH) / 2;   // Center horizontally
+    int y = (SCREEN_HEIGHT - QR_CODE_HEIGHT) / 2; // Center vertically
+    display.drawXbm(x, y, QR_CODE_WIDTH, QR_CODE_HEIGHT, qrBitmap);
+    display.display();
+}
+
+void drawPacketMonitor() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    
+    // Draw header
+    display.drawString(0, 0, "Ch:" + String(currentChannel));
+    display.drawString(64, 0, "Pkts:" + String(pkts));
+    display.drawString(0, 12, "Deauth:" + String(deauths));
+    
+    // Draw graph
+    display.drawLine(0, 35, 127, 35);
+    for (int i = 0; i < 127; i++) {
+        int height = (values[i] * multiplier > 30) ? 30 : values[i] * multiplier;
+        display.drawLine(i, 63, i, 63 - height);
+    }
+    
+    display.display();
+}
+
+void handlePacketMonitor() {
+    unsigned long currentTime = millis();
+    
+    // Channel switching with UP button (D3)
+    if (digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentChannel = (currentChannel % MAX_CH) + 1;
+        wifi_set_channel(currentChannel);
+        delay(200);
+    }
+    
+    if (currentTime - prevTime >= 1000) {
+        prevTime = currentTime;
+        
+        // Shift values left
+        for (int i = 0; i < 127; i++) {
+            values[i] = values[i + 1];
+        }
+        values[127] = pkts;
+        
+        // Calculate multiplier
+        unsigned long maxVal = 1;
+        for (int i = 0; i < 128; i++) {
+            if (values[i] > maxVal) maxVal = values[i];
+        }
+        multiplier = (maxVal > 30) ? 30.0 / maxVal : 1;
+        
+        drawPacketMonitor();
+        
+        // Reset counters
+        pkts = 0;
+        deauths = 0;
+    }
+    
+    // Check for back button
+    if (digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        wifi_promiscuous_enable(0);
+        WiFi.mode(WIFI_STA);
+        currentState = MENU_MAIN;
+        delay(200);
+    }
+}
+
+void scanNetworks() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 10, "Scanning...");
+    display.display();
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    
+    totalNetworks = WiFi.scanNetworks(false, true);
+    
+    // Store network information
+    for(int i = 0; i < min(totalNetworks, MAX_NETWORKS); i++) {
+        networks[i].ssid = WiFi.SSID(i);
+        networks[i].rssi = WiFi.RSSI(i);
+        networks[i].encType = WiFi.encryptionType(i);
+        networks[i].channel = WiFi.channel(i);
+    }
+}
+
+void drawWiFiList() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    
+    // Draw header
+    display.drawString(0, 0, "SSID (CH) RSSI");
+    display.drawLine(0, 11, 128, 11);
+    
+    // Draw networks
+    int displayCount = min(totalNetworks, 4); // Show 4 networks at a time
+    for(int i = 0; i < displayCount; i++) {
+        int networkIndex = i + scrollOffset;
+        if(networkIndex < totalNetworks) {
+            String networkInfo = networks[networkIndex].ssid;
+            networkInfo += " (" + String(networks[networkIndex].channel) + ") ";
+            networkInfo += String(networks[networkIndex].rssi) + "dB";
+            
+            // Truncate if too long
+            if(networkInfo.length() > 21) {
+                networkInfo = networkInfo.substring(0, 18) + "...";
+            }
+            
+            display.drawString(0, 13 + (i * 13), networkInfo);
+        }
+    }
+    
+    // Draw scroll indicators if needed
+    if(scrollOffset > 0) {
+        display.drawString(120, 13, "^");
+    }
+    if(scrollOffset + 4 < totalNetworks) {
+        display.drawString(120, 52, "v");
+    }
+    
+    display.display();
+}
+
+void handleWiFiScan() {
+    if(digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if(scrollOffset > 0) {
+            scrollOffset--;
+            drawWiFiList();
+        }
+        delay(200);
+    }
+    else if(digitalRead(BUTTON_DOWN) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if(scrollOffset + 4 < totalNetworks) {
+            scrollOffset++;
+            drawWiFiList();
+        }
+        delay(200);
+    }
+    else if(digitalRead(BUTTON_SELECT) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        scanNetworks();
+        scrollOffset = 0;
+        drawWiFiList();
+        delay(200);
+    }
+    else if(digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentState = MENU_MAIN;
+        delay(200);
+    }
+    
+    if(digitalRead(BUTTON_UP) == HIGH && digitalRead(BUTTON_DOWN) == HIGH &&
+       digitalRead(BUTTON_SELECT) == HIGH && digitalRead(BUTTON_BACK) == HIGH) {
+        buttonPressed = false;
+    }
+}
+
+void handleButtons() {
+    if (digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (selectedOption > 0) selectedOption--;
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_DOWN) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (selectedOption < mainMenuItems - 1) selectedOption++;
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_SELECT) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        switch (selectedOption) {
+            case 0: // WiFi Scan
+                currentState = MENU_WIFI_SCAN;
+                scanNetworks();
+                scrollOffset = 0;
+                drawWiFiList();
+                break;
+            case 1: // Packet Monitor
+                currentState = MENU_PACKET_MON;
+                setupWiFiSniffer();
+                memset(values, 0, sizeof(values));
+                break;
+            case 2: // Terminal
+                currentState = MENU_TERMINAL;
+                break;
+            case 3: // Code
+                currentState = MENU_CODE;
+                drawQRCode();
+                break;
+        }
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentState = MENU_MAIN;
+        delay(200);
+    }
+    
+    if (digitalRead(BUTTON_UP) == HIGH && digitalRead(BUTTON_DOWN) == HIGH &&
+        digitalRead(BUTTON_SELECT) == HIGH && digitalRead(BUTTON_BACK) == HIGH) {
+        buttonPressed = false;
+    }
+}
+
+void setup() {
+    // Initialize serial
+    Serial.begin(115200);
+    
+    // Initialize display
+    display.init();
+    display.flipScreenVertically();
+    display.setFont(ArialMT_Plain_10);
+    
+    // Initialize buttons
+    pinMode(BUTTON_UP, INPUT_PULLUP);
+    pinMode(BUTTON_DOWN, INPUT_PULLUP);
+    pinMode(BUTTON_SELECT, INPUT_PULLUP);
+    pinMode(BUTTON_BACK, INPUT_PULLUP);
+    
+    // Show splash screen
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 10, "WiFi Monitor");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(64, 35, "v1.0");
+    display.display();
+    delay(2000);
+    
+    // Initialize WiFi
+    WiFi.mode(WIFI_OFF);
+    wifi_set_opmode(STATION_MODE);
+}
+
+void loop() {
+    switch (currentState) {
+        case MENU_MAIN:
+            drawMenu();
+            handleButtons();
+            break;
+            
+        case MENU_WIFI_SCAN:
+            handleWiFiScan();
+            break;
+            
+        case MENU_PACKET_MON:
+            handlePacketMonitor();
+            break;
+            
+        case MENU_CODE:
+            if (digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+                buttonPressed = true;
+                currentState = MENU_MAIN;
+                delay(200);
+            }
+            break;
+            
+        default:
+            currentState = MENU_MAIN;
+            break;
+    }
+}
