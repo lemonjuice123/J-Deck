@@ -1,0 +1,625 @@
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include "SSD1306.h"
+
+bool autoScroll = true;  // Control auto-scrolling
+#include <EEPROM.h>
+
+extern "C" {
+#include "user_interface.h"
+typedef void (*wifi_promiscuous_cb_t)(uint8_t *buf, uint16_t len);
+}
+
+// Display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+SSD1306 display(0x3c, D2, D1);  // GPIO 5 = D1, GPIO 4 = D2
+
+// Button pins
+#define BUTTON_UP D7
+#define BUTTON_DOWN D3
+#define BUTTON_SELECT D5
+#define BUTTON_BACK D6
+#define AUDIO_IN D8 // Audio input pin
+
+
+
+// WiFi settings
+#define MAX_CH 13
+#define PACKET_RATE 8
+#define MAX_NETWORKS 8  // Maximum number of networks to display at once
+
+const int MAX_LINES = 100;  // Maximum number of lines to store
+const int LINE_LENGTH = 21;  // Maximum characters per line (128 pixels / 6 pixels per char)
+String textBuffer[MAX_LINES];
+int currentLine = 0;
+int displayOffset = 0;
+String currentReceiving = "";
+
+
+// Menu states
+enum MenuState {
+    MENU_MAIN,
+    MENU_WIFI_SCAN,
+    MENU_PACKET_MON,
+    MENU_TERMINAL,
+    MENU_SERIAL,  // Renamed from MENU_ESP_READER to MENU_SERIAL
+};
+
+MenuState currentState = MENU_MAIN;
+int selectedOption = 0;
+bool buttonPressed = false;
+int scrollOffset = 0;
+int totalNetworks = 0;
+
+// Struct to store network info
+struct NetworkInfo {
+    String ssid;
+    int32_t rssi;
+    uint8_t encType;
+    uint8_t* bssid;
+    int32_t channel;
+};
+
+// Game variables
+
+
+NetworkInfo networks[MAX_NETWORKS];
+
+// Packet monitoring variables
+unsigned long pkts = 0;
+unsigned long deauths = 0;
+unsigned long prevTime = 0;
+int currentChannel = 1;
+unsigned int values[128];
+double multiplier = 1.0;
+
+
+
+// Menu items
+const char* mainMenu[] = {
+    "WiFi Scan",
+    "Packet Monitor",
+    "Programmes",
+    "Serial"  // Changed from "Doodle Jump" to "ESP Reader"
+};
+
+const int mainMenuItems = 4;
+// Radio submenu items
+// Extended program commands
+const char* programCommands[] = {
+    "Beacon Flood",
+    "Custom Flood",
+    "mango run ",
+    "BLE Jam",
+    "WiFi Deauth",
+    "Beacon Flood",
+    "Rick Roll",
+    "WiFi Jammer",
+    "PMKID Attack",
+    "Evil Twin",
+    "Captive Portal",
+    "WiFi Sniffer",
+    "BT Sniffer",
+    "BLE Sniffer",
+    "GPS Spoofer",
+    "IR Blaster",
+    "RF Capture",
+    "SDR Monitor"
+};
+const int programCommandsCount = 18;
+
+
+
+// Function declarations
+void ICACHE_RAM_ATTR wifiSnifferCallback(uint8_t *buf, uint16_t len);
+void setupWiFiSniffer();
+void drawMenu();
+void handleButtons();
+void scanNetworks();
+void drawWiFiList();
+void handleWiFiScan();
+void handleTerminal();
+
+
+
+// Function implementations
+void ICACHE_RAM_ATTR wifiSnifferCallback(uint8_t *buf, uint16_t len) {
+    pkts++;
+    if (buf[12] == 0xA0 || buf[12] == 0xC0) {
+        deauths++;
+    }
+}
+
+void setupWiFiSniffer() {
+    wifi_set_opmode(STATION_MODE);
+    wifi_promiscuous_enable(0);
+    WiFi.disconnect();
+    wifi_set_promiscuous_rx_cb((wifi_promiscuous_cb_t)wifiSnifferCallback);
+    wifi_set_channel(currentChannel);
+    wifi_promiscuous_enable(1);
+}
+
+void drawMenu() {
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+
+    for (int i = 0; i < mainMenuItems; i++) {
+        if (i == selectedOption) {
+            display.drawString(0, i * 16, "|"); 
+        }
+        display.drawString(10, i * 16, mainMenu[i]);
+    }
+    display.display();
+}
+
+
+void drawPacketMonitor() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    
+    // Draw header
+    display.drawString(0, 0, "Ch:" + String(currentChannel));
+    display.drawString(64, 0, "Pkts:" + String(pkts));
+    display.drawString(0, 12, "Deauth:" + String(deauths));
+    
+    // Draw graph
+    display.drawLine(0, 35, 127, 35);
+    for (int i = 0; i < 127; i++) {
+        int height = (values[i] * multiplier > 30) ? 30 : values[i] * multiplier;
+        display.drawLine(i, 63, i, 63 - height);
+    }
+    
+    display.display();
+}
+
+void handlePacketMonitor() {
+    unsigned long currentTime = millis();
+    
+    // Channel switching with UP button (D3)
+    if (digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentChannel = (currentChannel % MAX_CH) + 1;
+        wifi_set_channel(currentChannel);
+        delay(200);
+    }
+    
+    if (currentTime - prevTime >= 1000) {
+        prevTime = currentTime;
+        
+        // Shift values left
+        for (int i = 0; i < 127; i++) {
+            values[i] = values[i + 1];
+        }
+        values[127] = pkts;
+        
+        // Calculate multiplier
+        unsigned long maxVal = 1;
+        for (int i = 0; i < 128; i++) {
+            if (values[i] > maxVal) maxVal = values[i];
+        }
+        multiplier = (maxVal > 30) ? 30.0 / maxVal : 1;
+        
+        drawPacketMonitor();
+        
+        // Reset counters
+        pkts = 0;
+        deauths = 0;
+    }
+    
+    // Check for back button
+    if (digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        wifi_promiscuous_enable(0);
+        WiFi.mode(WIFI_STA);
+        currentState = MENU_MAIN;
+        delay(200);
+    }
+}
+
+void scanNetworks() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 10, "Scanning...");
+    display.display();
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    
+    totalNetworks = WiFi.scanNetworks(false, true);
+    
+    // Store network information
+    for(int i = 0; i < min(totalNetworks, MAX_NETWORKS); i++) {
+        networks[i].ssid = WiFi.SSID(i);
+        networks[i].rssi = WiFi.RSSI(i);
+        networks[i].encType = WiFi.encryptionType(i);
+        networks[i].channel = WiFi.channel(i);
+    }
+}
+
+void drawWiFiList() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    
+    // Draw header
+    display.drawString(0, 0, "SSID (CH) RSSI");
+    display.drawLine(0, 11, 128, 11);
+    
+    // Draw networks
+    int displayCount = min(totalNetworks, 4); // Show 4 networks at a time
+    for(int i = 0; i < displayCount; i++) {
+        int networkIndex = i + scrollOffset;
+        if(networkIndex < totalNetworks) {
+            String networkInfo = networks[networkIndex].ssid;
+            networkInfo += " (" + String(networks[networkIndex].channel) + ") ";
+            networkInfo += String(networks[networkIndex].rssi) + "dB";
+            
+            // Truncate if too long
+            if(networkInfo.length() > 21) {
+                networkInfo = networkInfo.substring(0, 18) + "...";
+            }
+            
+            display.drawString(0, 13 + (i * 13), networkInfo);
+        }
+    }
+    
+    // Draw scroll indicators if needed
+    if(scrollOffset > 0) {
+        display.drawString(120, 13, "^");
+    }
+    if(scrollOffset + 4 < totalNetworks) {
+        display.drawString(120, 52, "v");
+    }
+    
+    display.display();
+}
+
+void handleWiFiScan() {
+    if(digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if(scrollOffset > 0) {
+            scrollOffset--;
+            drawWiFiList();
+        }
+        delay(200);
+    }
+    else if(digitalRead(BUTTON_DOWN) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if(scrollOffset + 4 < totalNetworks) {
+            scrollOffset++;
+            drawWiFiList();
+        }
+        delay(200);
+    }
+    else if(digitalRead(BUTTON_SELECT) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        scanNetworks();
+        scrollOffset = 0;
+        drawWiFiList();
+        delay(200);
+    }
+    else if(digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentState = MENU_MAIN;
+        delay(200);
+    }
+    
+    if(digitalRead(BUTTON_UP) == HIGH && digitalRead(BUTTON_DOWN) == HIGH &&
+       digitalRead(BUTTON_SELECT) == HIGH && digitalRead(BUTTON_BACK) == HIGH) {
+        buttonPressed = false;
+    }
+}
+
+void handleTerminal() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+
+    // Draw program commands with scrolling
+    int displayCount = 5; // Show 5 commands at a time
+    for (int i = 0; i < displayCount; i++) {
+        int commandIndex = i + scrollOffset;
+        if (commandIndex < programCommandsCount) {
+            if (commandIndex == selectedOption) {
+                display.drawString(0, i * 12, "|");
+            }
+            display.drawString(10, i * 12, programCommands[commandIndex]);
+        }
+    }
+
+    // Draw scroll indicators
+    if (scrollOffset > 0) {
+        display.drawString(120, 0, "^");
+    }
+    if (scrollOffset + displayCount < programCommandsCount) {
+        display.drawString(120, 52, "v");
+    }
+
+    display.display();
+
+    // Handle button inputs
+    if (digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (selectedOption > 0) {
+            selectedOption--;
+            if (selectedOption < scrollOffset) {
+                scrollOffset--;
+            }
+        }
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_DOWN) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (selectedOption < programCommandsCount - 1) {
+            selectedOption++;
+            if (selectedOption >= scrollOffset + 5) {
+                scrollOffset++;
+            }
+        }
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_SELECT) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        sendCommand(programCommands[selectedOption]);
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentState = MENU_MAIN;
+        selectedOption = 0;
+        scrollOffset = 0;
+        delay(200);
+    }
+
+    if (digitalRead(BUTTON_UP) == HIGH && digitalRead(BUTTON_DOWN) == HIGH &&
+        digitalRead(BUTTON_SELECT) == HIGH && digitalRead(BUTTON_BACK) == HIGH) {
+        buttonPressed = false;
+    }
+}
+
+void sendCommand(const char* command) {
+    Serial.println(command);
+    
+    // Show confirmation
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 20, "running ");
+    display.drawString(64, 35, command);
+    display.display();
+    delay(1000);
+}
+
+void loop() {
+    switch (currentState) {
+        case MENU_MAIN:
+            drawMenu();
+            handleButtons();
+            break;
+            
+        case MENU_WIFI_SCAN:
+            handleWiFiScan();
+            break;
+            
+        case MENU_PACKET_MON:
+            handlePacketMonitor();
+            break;
+            
+        case MENU_TERMINAL:
+            handleTerminal();
+            break;
+            
+        case MENU_SERIAL:  // Renamed from MENU_ESP_READER to MENU_SERIAL
+            
+            handleSerialMonitor();  // Renamed function
+            break;
+            
+        default:
+            currentState = MENU_MAIN;
+            break;
+    }
+}
+
+void handleButtons() {
+    if (digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (selectedOption > 0) selectedOption--;
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_DOWN) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (selectedOption < mainMenuItems - 1) selectedOption++;
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_SELECT) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        switch (selectedOption) {
+            case 0: // WiFi Scan
+                currentState = MENU_WIFI_SCAN;
+                scanNetworks();
+                scrollOffset = 0;
+                break;
+            case 1: // Packet Monitor
+                currentState = MENU_PACKET_MON;
+                setupWiFiSniffer();
+                memset(values, 0, sizeof(values));
+                break;
+            case 2: // Programs
+                currentState = MENU_TERMINAL;
+                selectedOption = 0;
+                scrollOffset = 0;
+                break;
+            case 3: // Serial Monitor
+                currentState = MENU_SERIAL;
+                displayOffset = 0;
+                currentLine = 0;
+                currentReceiving = "";
+                break;
+        }
+        delay(200);
+    }
+    
+    if (digitalRead(BUTTON_UP) == HIGH && digitalRead(BUTTON_DOWN) == HIGH &&
+        digitalRead(BUTTON_SELECT) == HIGH && digitalRead(BUTTON_BACK) == HIGH) {
+        buttonPressed = false;
+    }
+}
+
+// Modified setup function
+void setup() {
+    // Initialize serial
+    Serial.begin(115200);
+    
+    // Initialize display
+    display.init();
+    display.setFont(ArialMT_Plain_10);
+    
+    // Initialize buttons and audio pin
+    pinMode(BUTTON_UP, INPUT_PULLUP);
+    pinMode(BUTTON_DOWN, INPUT_PULLUP);
+    pinMode(BUTTON_SELECT, INPUT_PULLUP);
+    pinMode(BUTTON_BACK, INPUT_PULLUP);
+    pinMode(AUDIO_IN, OUTPUT);
+    
+    
+    
+    // Show text splash screen
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 10, "J Deck project");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(64, 35, "Version 6");
+    display.display();
+    delay(2000);  // Show text for 2 seconds
+    
+    // Initialize WiFi
+    WiFi.mode(WIFI_OFF);
+    wifi_set_opmode(STATION_MODE);
+}
+
+void drawSerialMonitor() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    
+    // Draw visible lines
+    int visibleLines = 6;  // Number of lines that fit on screen
+    for (int i = 0; i < visibleLines; i++) {
+        int bufferIndex = displayOffset + i;
+        if (bufferIndex < currentLine) {
+            display.drawString(0, i * 10, textBuffer[bufferIndex]);
+        }
+    }
+    
+    // Draw scroll indicators if needed
+    if (displayOffset > 0) {
+        display.drawString(120, 0, "^");
+    }
+    if (displayOffset + visibleLines < currentLine) {
+        display.drawString(120, 54, "v");
+    }
+    
+    // Show auto-scroll indicator
+    display.drawString(0, 54, autoScroll ? "A" : "M");  // A for Auto, M for Manual
+    
+    display.display();
+}
+
+
+
+// Function to handle Serial Monitor state
+void handleSerialMonitor() {
+    // Check for incoming serial data
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') {
+            // End of line received, add to buffer
+            addToBuffer(currentReceiving);
+            currentReceiving = "";
+            drawSerialMonitor();
+        } else {
+            currentReceiving += c;
+        }
+    }
+    
+    // Handle button inputs for scrolling
+    if (digitalRead(BUTTON_UP) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (displayOffset > 0) {
+            autoScroll = false;  // Disable auto-scroll when manually scrolling up
+            displayOffset--;
+            drawSerialMonitor();
+        }
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_DOWN) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        if (displayOffset + 6 < currentLine) {
+            displayOffset++;
+            // Re-enable auto-scroll if we scroll to the bottom manually
+            if (displayOffset >= currentLine - 6) {
+                autoScroll = true;
+            }
+            drawSerialMonitor();
+        }
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_SELECT) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        autoScroll = !autoScroll;  // Toggle auto-scroll
+        if (autoScroll && currentLine > 6) {
+            displayOffset = currentLine - 6;  // Jump to bottom when enabling auto-scroll
+        }
+        drawSerialMonitor();
+        delay(200);
+    }
+    else if (digitalRead(BUTTON_BACK) == LOW && !buttonPressed) {
+        buttonPressed = true;
+        currentState = MENU_MAIN;
+        delay(200);
+    }
+    
+    if (digitalRead(BUTTON_UP) == HIGH && digitalRead(BUTTON_DOWN) == HIGH &&
+        digitalRead(BUTTON_SELECT) == HIGH && digitalRead(BUTTON_BACK) == HIGH) {
+        buttonPressed = false;
+    }
+}
+
+void addToBuffer(String text) {
+    // Split incoming text into lines that fit the display
+    while (text.length() > 0) {
+        String line;
+        if (text.length() > LINE_LENGTH) {
+            line = text.substring(0, LINE_LENGTH);
+            text = text.substring(LINE_LENGTH);
+        } else {
+            line = text;
+            text = "";
+        }
+        
+        // Add line to buffer
+        if (currentLine < MAX_LINES) {
+            textBuffer[currentLine] = line;
+            currentLine++;
+        } else {
+            // Buffer is full, shift everything up
+            for (int i = 0; i < MAX_LINES - 1; i++) {
+                textBuffer[i] = textBuffer[i + 1];
+            }
+            textBuffer[MAX_LINES - 1] = line;
+        }
+
+        // Auto-scroll if enabled
+        if (autoScroll) {
+            if (currentLine > 6) {  // If we have more than 6 lines
+                displayOffset = currentLine - 6;  // Show the last 6 lines
+            }
+        }
+    }
+}
+
